@@ -1,0 +1,9 @@
+# Core app
+streamlit>=1.34.0
+pandas>=2.0.0
+requests>=2.31.0
+
+# For timezone handling (Python 3.9+ has zoneinfo built-in; tzdata helps in containers)
+tzdata>=2023.3
+
+# BeautifulSoup not used in the final Jina-based version, so omitted
