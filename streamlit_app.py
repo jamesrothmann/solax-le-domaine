@@ -234,8 +234,10 @@ def post_xml_to_mii(xml_payload: bytes) -> tuple[int, str]:
     }
     try:
         r = requests.post(MII_ENDPOINT, headers=headers, data=xml_payload, timeout=60)
+        print(f"[MII] POST {MII_ENDPOINT} -> {r.status_code} {r.text[:200]}")
         return r.status_code, r.text[:1000]
     except Exception as e:
+        print(f"[MII] POST {MII_ENDPOINT} failed: {e}")
         return 0, str(e)
 
 # ------------------------------------------------------------
@@ -271,6 +273,7 @@ def manual_xml_and_transfer() -> tuple[int, str]:
         raise RuntimeError("No rows for today yet. Fetch at least once before generating XML.")
     xml_bytes = build_mii_xml_hourly(day_df)
     code, body = post_xml_to_mii(xml_bytes)
+    print(f"[MII] Manual transfer -> {code} {body[:200]}")
     return code, body
 
 # ------------------------------------------------------------
