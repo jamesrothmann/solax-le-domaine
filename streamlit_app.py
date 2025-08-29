@@ -3,38 +3,48 @@
 # - Fetches Daily yield kWh via Jina every hour 04:00–20:00 SAST
 # - Logs to CSV with interval_kwh computed from deltas
 # - At 21:00 SAST builds XML with hourly datapoints (interval=3600) using E_INT = interval_kwh
-# - Posts XML to meteocontrol HTTPS endpoint (VCOM MII)
+# - Pushes data via FTP into the root directory (no subdirectories)
 # - Provides a black + light-green "hacker" UI
-# - Includes buttons: fetch data manually, manually generate xml and transfer data
+# - Includes buttons: fetch data manually, manually generate xml and upload via FTP
+# - Shows FTP upload results in both UI and console
 # - All secrets are read from .streamlit/secrets.toml
 #
-# Secrets required in .streamlit/secrets.toml:
+# Example .streamlit/secrets.toml
 # [general]
 # PLANT_NAME = "Solax Le Domaine Plant"
-# viewer_passwords = ["optional-password"]        # optional
+# viewer_passwords = ["optional-password"]
 #
 # [jina]
 # JINA_URL   = "https://r.jina.ai/"
 # JINA_TOKEN = "YOUR_JINA_TOKEN"
-# SHARE_URL  = "https://www.solaxcloud.com/..."   # your public/share URL
+# SHARE_URL  = "https://your_public_page"
 #
-# [mii]
-# MII_MODE   = "import"                           # "import" or "validation"
-# MII_API_KEY = "YOUR_MII_API_KEY"
+# [ftp]
+# FTP_HOST     = "ftp.meteocontrol.de"    # from portal
+# FTP_PORT     = 21                       # optional
+# FTP_USERNAME = "provided_user"
+# FTP_PASSWORD = "provided_pass"
+# FTP_TLS      = true                     # true for FTPS, false for plain FTP
+# FTP_COMPRESS = "none"                   # one of: none, gz, bz2, zlib
 #
 # Environment:
 #   Python 3.10+
-#   pip install streamlit requests pandas lxml  (lxml optional, stdlib ET is used)
+#   pip install streamlit requests pandas
 
 import os
 import re
+import io
 import csv
+import bz2
+import zlib
+import gzip
 import json
 import time
 import queue
+import ftplib
 import threading
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional, Tuple, Dict, Iterable
 
 try:
@@ -48,7 +58,7 @@ import streamlit as st
 import xml.etree.ElementTree as ET
 
 # ------------------------------------------------------------
-# Config and paths (secure values via st.secrets)
+# Config and paths
 # ------------------------------------------------------------
 DATA_DIR = Path(os.getenv("SOLAX_APP_DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,34 +67,35 @@ CSV_FILE = DATA_DIR / "solax_daily_kwh_log.csv"
 STATE_FILE = DATA_DIR / "state.json"
 SNAPSHOT_MD = DATA_DIR / "solax_share_snapshot.md"
 XML_OUT = DATA_DIR / "solax_le_domaine_hourly.xml"
-LAST_POST_JSON = DATA_DIR / "last_post_result.json"
+LAST_PUSH_JSON = DATA_DIR / "last_push_result.json"
 
 TZ_NAME = "Africa/Johannesburg"
 TZ = ZoneInfo(TZ_NAME) if ZoneInfo else None
 
-PLANT_NAME = st.secrets.get("PLANT_NAME", "Solax Le Domaine Plant")
+PLANT_NAME = st.secrets.get("PLANT_NAME", st.secrets.get("general", {}).get("PLANT_NAME", "Solax Le Domaine Plant"))
 
-# Jina browser API secrets section names kept for clarity
-JINA_URL = st.secrets.get("JINA_URL", st.secrets.get("jina", {}).get("JINA_URL", "https://r.jina.ai/"))
+# Jina
+JINA_URL   = st.secrets.get("JINA_URL",   st.secrets.get("jina", {}).get("JINA_URL", "https://r.jina.ai/"))
 JINA_TOKEN = st.secrets.get("JINA_TOKEN", st.secrets.get("jina", {}).get("JINA_TOKEN"))
-SHARE_URL = st.secrets.get("SHARE_URL", st.secrets.get("jina", {}).get("SHARE_URL"))
+SHARE_URL  = st.secrets.get("SHARE_URL",  st.secrets.get("jina", {}).get("SHARE_URL"))
 
-# Meteocontrol MII
-_mii_mode = st.secrets.get("MII_MODE", st.secrets.get("mii", {}).get("MII_MODE", "import")).lower()
-MII_API_KEY = st.secrets.get("MII_API_KEY", st.secrets.get("mii", {}).get("MII_API_KEY"))
-MII_IMPORT_ENDPOINT = "https://mii.meteocontrol.de/v2/"
-MII_VALIDATION_ENDPOINT = "https://mii.meteocontrol.de/v2-validation/"
-MII_ENDPOINT = MII_IMPORT_ENDPOINT if _mii_mode == "import" else MII_VALIDATION_ENDPOINT
+# FTP
+FTP_HOST     = st.secrets.get("FTP_HOST",     st.secrets.get("ftp", {}).get("FTP_HOST"))
+FTP_PORT     = int(st.secrets.get("FTP_PORT", st.secrets.get("ftp", {}).get("FTP_PORT", 21)))
+FTP_USERNAME = st.secrets.get("FTP_USERNAME", st.secrets.get("ftp", {}).get("FTP_USERNAME"))
+FTP_PASSWORD = st.secrets.get("FTP_PASSWORD", st.secrets.get("ftp", {}).get("FTP_PASSWORD"))
+FTP_TLS      = bool(st.secrets.get("FTP_TLS", st.secrets.get("ftp", {}).get("FTP_TLS", True)))
+FTP_COMPRESS = (st.secrets.get("FTP_COMPRESS", st.secrets.get("ftp", {}).get("FTP_COMPRESS", "none")) or "none").lower()
 
-# Viewer auth (viewer-only; scheduler runs regardless)
+# Viewer auth
 VIEWER_PASSWORDS = set(st.secrets.get("viewer_passwords", st.secrets.get("general", {}).get("viewer_passwords", [])))
 
-# Scheduled hours in SAST
-HOUR_WINDOW_START = 4    # inclusive
-HOUR_WINDOW_END = 20     # inclusive
-XML_POST_HOUR = 21       # 21:00 SAST
+# Schedule
+HOUR_WINDOW_START = 4
+HOUR_WINDOW_END   = 20
+XML_POST_HOUR     = 21
 
-# Datalogger identity for VCOM XML
+# Datalogger identity used in XML and filename
 DL_VENDOR = "SolaX"
 DL_SERIAL = "DL-PUBLIC-SHARE"
 DEVICE_ID = "inverter-1"
@@ -98,20 +109,11 @@ def now_utc() -> datetime:
 
 def now_sast() -> datetime:
     if TZ is None:
-        # best effort fallback to local time
         return datetime.fromtimestamp(time.time())
     return now_utc().astimezone(TZ)
 
-def utc_from_sast_components(d: datetime, hour: int) -> datetime:
-    """Build a SAST datetime at given hour and return as UTC aware dt"""
-    if TZ is None:
-        # fallback - assume local is SAST-ish
-        return datetime(d.year, d.month, d.day, hour, 0, 0, tzinfo=timezone.utc)
-    local_dt = datetime(d.year, d.month, d.day, hour, 0, 0, tzinfo=TZ)
-    return local_dt.astimezone(timezone.utc)
-
 # ------------------------------------------------------------
-# Fetch and parse Daily yield via Jina (markdown snapshot)
+# Fetch and parse Daily yield via Jina
 # ------------------------------------------------------------
 def fetch_markdown_via_jina(page_url: str) -> str:
     if not JINA_TOKEN:
@@ -133,14 +135,12 @@ def fetch_markdown_via_jina(page_url: str) -> str:
     return md
 
 def extract_daily_kwh_from_markdown(md: str) -> float:
-    # Primary: "Daily yield ... <number> kWh"
     pat = re.compile(
         r"Daily\s*yield[^0-9\-]*([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]+)?|[0-9]+(?:\.[0-9]+)?)\s*kWh",
         re.IGNORECASE
     )
     m = pat.search(md)
     if not m:
-        # Fallback: first number on a "Daily yield" line
         number_str = None
         for line in md.splitlines():
             if "daily" in line.lower() and "yield" in line.lower():
@@ -185,7 +185,6 @@ def compute_interval(prev_daily_kwh: Optional[float], current_daily_kwh: float) 
         return current_daily_kwh
     diff = current_daily_kwh - prev_daily_kwh
     if diff < 0:
-        # new day rollover
         return current_daily_kwh
     return diff
 
@@ -197,7 +196,6 @@ def parse_csv() -> pd.DataFrame:
         return pd.DataFrame(columns=["timestamp_utc", "timestamp_sast", "daily_kwh", "interval_kwh"])
     df = pd.read_csv(CSV_FILE)
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-    # Keep a local copy for day filtering
     if TZ is not None:
         df["timestamp_sast_dt"] = df["timestamp_utc"].dt.tz_convert(TZ)
     else:
@@ -205,10 +203,6 @@ def parse_csv() -> pd.DataFrame:
     return df
 
 def rows_for_sast_day(target_day) -> pd.DataFrame:
-    """
-    Return rows whose local SAST calendar date equals target_day (date object).
-    Sorted ascending for chronological datapoints.
-    """
     df = parse_csv()
     if df.empty:
         return df
@@ -217,37 +211,26 @@ def rows_for_sast_day(target_day) -> pd.DataFrame:
     day_df = day_df.sort_values("timestamp_utc").reset_index(drop=True)
     return day_df
 
-def expected_hour_grid_utc(target_day) -> Iterable[datetime]:
-    """Yield expected UTC datetimes for each hour in the configured window of the SAST day."""
-    for h in range(HOUR_WINDOW_START, HOUR_WINDOW_END + 1):
-        yield utc_from_sast_components(datetime(target_day.year, target_day.month, target_day.day), h)
-
 # ------------------------------------------------------------
-# XML build and HTTPS post (hourly intervals) - fixed namespaces
+# XML build with correct namespaces
 # ------------------------------------------------------------
 def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
     """
-    Build an MII XML document with one datapoint per hour in the configured SAST window.
+    Build an MII XML document with one datapoint per row in day_df.
     interval="3600" and mv t="E_INT" with value in kWh for that hour.
-    - Root and <datalogger> in main namespace http://api.sspcdn.com/mii
-    - <configuration> in http://api.sspcdn.com/mii/datalogger/configuration
-    - <datapoints> in http://api.sspcdn.com/mii/datalogger/datapoints
     """
     NS_MAIN   = "http://api.sspcdn.com/mii"
     NS_CONFIG = "http://api.sspcdn.com/mii/datalogger/configuration"
     NS_DATA   = "http://api.sspcdn.com/mii/datalogger/datapoints"
 
-    # Register namespaces - default only for main
     ET.register_namespace("", NS_MAIN)
     ET.register_namespace("cfg", NS_CONFIG)
     ET.register_namespace("dp", NS_DATA)
 
-    # Root
     mii = ET.Element(ET.QName(NS_MAIN, "mii"),
                      attrib={"version": "2.0", "targetNamespace": NS_MAIN})
     datalogger = ET.SubElement(mii, ET.QName(NS_MAIN, "datalogger"))
 
-    # configuration block
     cfg = ET.SubElement(datalogger, ET.QName(NS_CONFIG, "configuration"))
     uuid_el = ET.SubElement(cfg, ET.QName(NS_CONFIG, "uuid"))
     ET.SubElement(uuid_el, ET.QName(NS_CONFIG, "vendor")).text = DL_VENDOR
@@ -262,26 +245,11 @@ def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
                         attrib={"type": "inverter", "id": DEVICE_ID})
     ET.SubElement(dev, ET.QName(NS_CONFIG, "uid")).text = DEVICE_UID
 
-    # datapoints block
     dps = ET.SubElement(datalogger, ET.QName(NS_DATA, "datapoints"))
 
-    # Build a map from exact UTC hour to interval_kwh
-    hour_map: Dict[datetime, float] = {}
-    if not day_df.empty:
-        # Round any accidental minute offsets down to exact hour
-        day_df["hour_utc"] = day_df["timestamp_utc"].dt.floor("H")
-        for _, row in day_df.iterrows():
-            hour_map[row["hour_utc"].to_pydatetime()] = float(row["interval_kwh"])
-
-    target_day = day_df["timestamp_sast_dt"].dt.date.iloc[0] if not day_df.empty else now_sast().date()
-
-    # Emit one datapoint per expected hour in the SAST window
-    missing_hours = []
-    for ts_utc in expected_hour_grid_utc(target_day):
-        interval_kwh = float(hour_map.get(ts_utc.replace(minute=0, second=0, microsecond=0), 0.0))
-        if ts_utc not in hour_map:
-            missing_hours.append(ts_utc.isoformat())
-
+    for _, row in day_df.iterrows():
+        ts_utc = pd.to_datetime(row["timestamp_utc"], utc=True)
+        interval_kwh = float(row["interval_kwh"])
         dp = ET.SubElement(dps, ET.QName(NS_DATA, "datapoint"), attrib={
             "interval": "3600",
             "timestamp": ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -292,50 +260,77 @@ def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
 
     xml_bytes = ET.tostring(mii, encoding="utf-8", xml_declaration=True)
     XML_OUT.write_bytes(xml_bytes)
-
-    if missing_hours:
-        print(f"[MII] Warning - missing hourly samples filled with 0. Hours (UTC): {missing_hours[:6]}{'...' if len(missing_hours)>6 else ''}")
-
     return xml_bytes
 
-def post_xml_to_mii(xml_payload: bytes) -> Tuple[int, str]:
-    """Post to MII endpoint and return (status_code, response_text). Also log to console and file."""
-    if not MII_API_KEY:
-        raise RuntimeError("MII_API_KEY is missing in secrets.")
+# ------------------------------------------------------------
+# FTP helpers
+# ------------------------------------------------------------
+def _compress_bytes(xml_bytes: bytes, mode: str) -> Tuple[bytes, str]:
+    mode = (mode or "none").lower()
+    if mode == "gz":
+        return gzip.compress(xml_bytes), "xml.gz"
+    if mode == "bz2":
+        return bz2.compress(xml_bytes), "xml.bz2"
+    if mode == "zlib":
+        return zlib.compress(xml_bytes), "xml.zlib"
+    return xml_bytes, "xml"
 
-    headers = {
-        "Content-Type": "application/xml; charset=utf-8",
-        "Accept": "application/json",
-        "api-key": MII_API_KEY,
-    }
+def _build_unique_filename(serial: str, ext: str) -> str:
+    # Use UTC timestamp to guarantee uniqueness
+    ts = now_utc().strftime("%Y%m%d_%H%M%S")
+    return f"{ts}_{serial}.{ext}"
+
+def _ftp_connect() -> ftplib.FTP:
+    host, port = FTP_HOST, FTP_PORT
+    if not host or not FTP_USERNAME or not FTP_PASSWORD:
+        raise RuntimeError("FTP credentials are missing in secrets.")
+    if FTP_TLS:
+        ftp = ftplib.FTP_TLS()
+        ftp.connect(host=host, port=port, timeout=30)
+        welcome = ftp.getwelcome()
+        print(f"[FTP] Connected (FTPS). Welcome: {welcome}")
+        ftp.auth()
+        ftp.login(user=FTP_USERNAME, passwd=FTP_PASSWORD)
+        ftp.prot_p()  # secure data connection
+    else:
+        ftp = ftplib.FTP()
+        ftp.connect(host=host, port=port, timeout=30)
+        welcome = ftp.getwelcome()
+        print(f"[FTP] Connected (FTP). Welcome: {welcome}")
+        ftp.login(user=FTP_USERNAME, passwd=FTP_PASSWORD)
+    ftp.set_pasv(True)
+    return ftp
+
+def push_via_ftp(file_bytes: bytes, remote_filename: str) -> Tuple[bool, str]:
+    # Spec: root directory only, no subdirectories
+    if len(file_bytes) > 5 * 1024 * 1024:
+        return False, "File size exceeds 5 MB after decompression limit"
     try:
-        r = requests.post(MII_ENDPOINT, headers=headers, data=xml_payload, timeout=60)
-        code, body = r.status_code, (r.text or "")
-        print(f"[MII] POST {MII_ENDPOINT} -> {code} {body[:200].replace(os.linesep, ' ')}")
-        LAST_POST_JSON.write_text(json.dumps({
-            "time": now_sast().isoformat(),
-            "endpoint": MII_ENDPOINT,
-            "status": code,
-            "body": body[:2000]
-        }, indent=2), encoding="utf-8")
-        return code, body[:2000]
-    except Exception as e:
-        print(f"[MII] POST {MII_ENDPOINT} failed: {e}")
-        return 0, str(e)
-
-# ------------------------------------------------------------
-# State management for scheduler
-# ------------------------------------------------------------
-def load_state() -> dict:
-    if STATE_FILE.exists():
+        bio = io.BytesIO(file_bytes)
+        ftp = _ftp_connect()
+        # ensure we are at root
         try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            ftp.cwd("/")
         except Exception:
             pass
-    return {"last_fetch_iso": None, "last_xml_sent_date": None}
-
-def save_state(state: dict):
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        resp = ftp.storbinary(f"STOR {remote_filename}", bio)
+        # ftplib.storbinary returns None on success; we can issue a NOOP to get a response string
+        noop_resp = ""
+        try:
+            noop_resp = ftp.voidcmd("NOOP")
+        except Exception:
+            noop_resp = "226 Transfer complete (assumed)"
+        try:
+            ftp.quit()
+        except Exception:
+            ftp.close()
+        msg = f"Upload ok: {remote_filename} | server: {noop_resp}"
+        print(f"[FTP] {msg}")
+        return True, msg
+    except Exception as e:
+        err = f"FTP upload failed: {e}"
+        print(f"[FTP] {err}")
+        return False, err
 
 # ------------------------------------------------------------
 # Jobs
@@ -349,19 +344,36 @@ def run_fetch_job() -> dict:
     append_csv(now_utc(), daily_kwh, interval)
     return {"daily_kwh": daily_kwh, "interval_kwh": interval}
 
-def manual_xml_and_transfer() -> Tuple[int, str]:
-    # Build for today's SAST day
+def manual_xml_and_push() -> Tuple[str, str]:
     day_df = rows_for_sast_day(now_sast().date())
     if day_df.empty:
         raise RuntimeError("No rows for today yet. Fetch at least once before generating XML.")
     xml_bytes = build_mii_xml_hourly(day_df)
-    code, body = post_xml_to_mii(xml_bytes)
-    print(f"[MII] Manual transfer -> {code} {body[:200].replace(os.linesep, ' ')}")
-    return code, body
+    payload, ext = _compress_bytes(xml_bytes, FTP_COMPRESS)
+    remote_name = _build_unique_filename(DL_SERIAL, ext)
+    ok, msg = push_via_ftp(payload, remote_name)
+    LAST_PUSH_JSON.write_text(json.dumps({
+        "time": now_sast().isoformat(),
+        "filename": remote_name,
+        "ok": ok,
+        "message": msg
+    }, indent=2), encoding="utf-8")
+    return remote_name, msg
 
 # ------------------------------------------------------------
-# Scheduler loop
+# State management and scheduler
 # ------------------------------------------------------------
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"last_fetch_iso": None, "last_xml_sent_date": None}
+
+def save_state(state: dict):
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
 def scheduler_loop(stop_event: threading.Event, status_queue: queue.Queue):
     state = load_state()
 
@@ -372,7 +384,7 @@ def scheduler_loop(stop_event: threading.Event, status_queue: queue.Queue):
             minute = local_now.minute
             today_str = local_now.date().isoformat()
 
-            # Hourly run at minute 0 within the window
+            # hourly fetch at minute 0
             should_run_hourly = (HOUR_WINDOW_START <= hour <= HOUR_WINDOW_END) and (minute == 0)
 
             last_fetch_iso = state.get("last_fetch_iso")
@@ -396,22 +408,29 @@ def scheduler_loop(stop_event: threading.Event, status_queue: queue.Queue):
                 save_state(state)
                 status_queue.put({"type": "fetch", "time": local_now.isoformat(), "result": result})
 
-            # At 21:00 SAST, build hourly XML for today and post once
+            # nightly XML build and FTP push
             last_sent_date = state.get("last_xml_sent_date")
             if hour == XML_POST_HOUR and minute == 0 and last_sent_date != today_str:
                 day_df = rows_for_sast_day(local_now.date())
                 if not day_df.empty:
                     try:
                         xml_bytes = build_mii_xml_hourly(day_df)
-                        code, body = post_xml_to_mii(xml_bytes)
-                        if code == 202:
+                        payload, ext = _compress_bytes(xml_bytes, FTP_COMPRESS)
+                        remote_name = _build_unique_filename(DL_SERIAL, ext)
+                        ok, msg = push_via_ftp(payload, remote_name)
+                        LAST_PUSH_JSON.write_text(json.dumps({
+                            "time": now_sast().isoformat(),
+                            "filename": remote_name,
+                            "ok": ok,
+                            "message": msg
+                        }, indent=2), encoding="utf-8")
+                        if ok:
                             state["last_xml_sent_date"] = today_str
                             save_state(state)
-                        status_queue.put({"type": "xml", "time": local_now.isoformat(), "status": code, "body": body[:300]})
+                        status_queue.put({"type": "ftp", "time": local_now.isoformat(), "ok": ok, "filename": remote_name, "msg": msg[:300]})
                     except Exception as e:
-                        status_queue.put({"type": "xml_error", "time": local_now.isoformat(), "error": str(e)})
+                        status_queue.put({"type": "ftp_error", "time": local_now.isoformat(), "error": str(e)})
 
-            # Sleep in small steps so stop_event is responsive
             stop_event.wait(20)
         except Exception as e:
             status_queue.put({"type": "loop_error", "time": now_sast().isoformat(), "error": str(e)})
@@ -482,7 +501,8 @@ def render_dashboard(status_q: queue.Queue):
 
     st.divider()
 
-    c1, c2 = st.columns(2)
+    # Controls
+    c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("fetch data manually"):
             try:
@@ -491,17 +511,29 @@ def render_dashboard(status_q: queue.Queue):
             except Exception as e:
                 st.error(f"Manual fetch failed: {e}")
     with c2:
-        if st.button("manually generate xml and transfer data"):
+        if st.button("generate xml and upload via ftp"):
             try:
-                code, body = manual_xml_and_transfer()
-                if code == 202:
-                    st.success(f"XML posted. HTTP {code}")
-                else:
-                    st.warning(f"Posted XML. HTTP {code}. Response preview: {body[:200]}")
+                filename, msg = manual_xml_and_push()
+                st.success(f"Uploaded: {filename}. {msg}")
             except Exception as e:
-                st.error(f"Manual XML transfer failed: {e}")
+                st.error(f"Manual FTP push failed: {e}")
+    with c3:
+        if st.button("test ftp login"):
+            try:
+                ftp = _ftp_connect()
+                try:
+                    pwd = ftp.pwd()
+                except Exception:
+                    pwd = "/"
+                try:
+                    ftp.quit()
+                except Exception:
+                    ftp.close()
+                st.success(f"FTP login ok. Working dir: {pwd}")
+            except Exception as e:
+                st.error(f"FTP login failed: {e}")
 
-    # Data table (newest first)
+    # Data table
     if CSV_FILE.exists():
         df = pd.read_csv(CSV_FILE)
         if "timestamp_utc" in df.columns:
@@ -523,38 +555,64 @@ def render_dashboard(status_q: queue.Queue):
     while not status_q.empty():
         events.append(status_q.get())
     if events:
-        for ev in reversed(events[-80:]):
+        for ev in reversed(events[-100:]):
             if ev["type"] == "fetch":
-                st.write(
-                    f"Fetched at {ev['time']} — Daily {ev['result']['daily_kwh']:.3f} kWh — Interval {ev['result']['interval_kwh']:.3f} kWh"
-                )
-            elif ev["type"] == "xml":
-                st.write(f"XML posted at {ev['time']} — HTTP {ev['status']}")
+                st.write(f"Fetched at {ev['time']} — Daily {ev['result']['daily_kwh']:.3f} kWh — Interval {ev['result']['interval_kwh']:.3f} kWh")
+            elif ev["type"] == "ftp":
+                st.write(f"FTP push at {ev['time']} — ok={ev['ok']} — {ev['filename']} — {ev['msg']}")
             else:
                 st.write(f"{ev['type']} at {ev['time']} — {ev.get('error','')[:200]}")
     else:
         st.caption("No scheduler messages yet.")
 
     st.divider()
-    st.subheader("XML transfer")
-    st.markdown(f"- Mode: **{_mii_mode}**  • Endpoint: `{MII_ENDPOINT}`")
+    st.subheader("Transfer info")
+    st.markdown(f"- FTP host: `{FTP_HOST}:{FTP_PORT}` • TLS: `{FTP_TLS}` • Compression: `{FTP_COMPRESS}`")
     if XML_OUT.exists():
-        st.markdown(f"- Last XML file: `{XML_OUT}`  • Size: {XML_OUT.stat().st_size} bytes")
+        st.markdown(f"- Last XML file: `{XML_OUT}` • Size: {XML_OUT.stat().st_size} bytes")
         with XML_OUT.open("rb") as f:
             preview = f.read(800).decode("utf-8", errors="ignore")
         st.code(preview + ("\n..." if XML_OUT.stat().st_size > 800 else ""), language="xml")
         st.download_button("Download last XML", XML_OUT.read_bytes(), file_name=XML_OUT.name, mime="application/xml")
-    if LAST_POST_JSON.exists():
-        st.caption("Last POST result:")
-        st.code(LAST_POST_JSON.read_text(encoding="utf-8")[:2000], language="json")
+    if LAST_PUSH_JSON.exists():
+        st.caption("Last push result:")
+        st.code(LAST_PUSH_JSON.read_text(encoding="utf-8")[:2000], language="json")
 
 # ------------------------------------------------------------
 # App entry
 # ------------------------------------------------------------
+def apply_hacker_theme():
+    st.markdown("""
+    <style>
+      :root {
+        --bg: #0b0f0c;
+        --card: #0f1511;
+        --fg: #b7ffbf;
+        --muted: #57d364;
+        --accent: #23c552;
+      }
+      .stApp { background: var(--bg) !important; color: var(--fg) !important; }
+      .stMarkdown, .stText, .stDataFrame, .stTable, .stTextInput, .stButton { color: var(--fg) !important; }
+      .block-container { padding-top: 1.5rem; }
+      div[data-baseweb="input"] input { color: var(--fg) !important; background: #0d140f !important; }
+      .stButton>button {
+        background: #0d140f; border: 1px solid var(--muted); color: var(--fg);
+        border-radius: 10px; padding: 0.5rem 1rem;
+      }
+      .stButton>button:hover { border-color: var(--accent); }
+      .css-1v0mbdj, .ef3psqc12 { background: var(--card) !important; }
+      h1,h2,h3 {
+        color: var(--accent) !important;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      }
+      .metric { background: var(--card); padding: 10px 14px; border: 1px solid var(--muted); border-radius: 12px; }
+      .stDataFrame { border: 1px solid var(--muted); border-radius: 10px; }
+    </style>
+    """, unsafe_allow_html=True)
+
 apply_hacker_theme()
 stop_event, status_q = start_scheduler()
 
-# Gate only the viewer. Scheduler is always running.
 if not check_password():
     st.stop()
 
