@@ -3,10 +3,28 @@
 # - Fetches Daily yield kWh via Jina every hour 04:00–20:00 SAST
 # - Logs to CSV with interval_kwh computed from deltas
 # - At 21:00 SAST builds XML with hourly datapoints (interval=3600) using E_INT = interval_kwh
-# - Posts XML to meteocontrol HTTPS endpoint
-# - Provides a black + light-green “hacker” UI
+# - Posts XML to meteocontrol HTTPS endpoint (VCOM MII)
+# - Provides a black + light-green "hacker" UI
 # - Includes buttons: fetch data manually, manually generate xml and transfer data
 # - All secrets are read from .streamlit/secrets.toml
+#
+# Secrets required in .streamlit/secrets.toml:
+# [general]
+# PLANT_NAME = "Solax Le Domaine Plant"
+# viewer_passwords = ["optional-password"]        # optional
+#
+# [jina]
+# JINA_URL   = "https://r.jina.ai/"
+# JINA_TOKEN = "YOUR_JINA_TOKEN"
+# SHARE_URL  = "https://www.solaxcloud.com/..."   # your public/share URL
+#
+# [mii]
+# MII_MODE   = "import"                           # "import" or "validation"
+# MII_API_KEY = "YOUR_MII_API_KEY"
+#
+# Environment:
+#   Python 3.10+
+#   pip install streamlit requests pandas lxml  (lxml optional, stdlib ET is used)
 
 import os
 import re
@@ -16,8 +34,8 @@ import time
 import queue
 import threading
 from pathlib import Path
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, Tuple, Dict, Iterable
 
 try:
     from zoneinfo import ZoneInfo  # Python 3.9+
@@ -39,30 +57,38 @@ CSV_FILE = DATA_DIR / "solax_daily_kwh_log.csv"
 STATE_FILE = DATA_DIR / "state.json"
 SNAPSHOT_MD = DATA_DIR / "solax_share_snapshot.md"
 XML_OUT = DATA_DIR / "solax_le_domaine_hourly.xml"
+LAST_POST_JSON = DATA_DIR / "last_post_result.json"
 
 TZ_NAME = "Africa/Johannesburg"
+TZ = ZoneInfo(TZ_NAME) if ZoneInfo else None
 
 PLANT_NAME = st.secrets.get("PLANT_NAME", "Solax Le Domaine Plant")
 
-# Jina browser API
-JINA_URL = st.secrets.get("JINA_URL", "https://r.jina.ai/")
-JINA_TOKEN = st.secrets["JINA_TOKEN"]           # required
-SHARE_URL = st.secrets["SHARE_URL"]             # required
+# Jina browser API secrets section names kept for clarity
+JINA_URL = st.secrets.get("JINA_URL", st.secrets.get("jina", {}).get("JINA_URL", "https://r.jina.ai/"))
+JINA_TOKEN = st.secrets.get("JINA_TOKEN", st.secrets.get("jina", {}).get("JINA_TOKEN"))
+SHARE_URL = st.secrets.get("SHARE_URL", st.secrets.get("jina", {}).get("SHARE_URL"))
 
 # Meteocontrol MII
-MII_MODE = st.secrets.get("MII_MODE", "import").lower()   # "import" or "validation"
-MII_API_KEY = st.secrets["MII_API_KEY"]                   # required
+_mii_mode = st.secrets.get("MII_MODE", st.secrets.get("mii", {}).get("MII_MODE", "import")).lower()
+MII_API_KEY = st.secrets.get("MII_API_KEY", st.secrets.get("mii", {}).get("MII_API_KEY"))
 MII_IMPORT_ENDPOINT = "https://mii.meteocontrol.de/v2/"
 MII_VALIDATION_ENDPOINT = "https://mii.meteocontrol.de/v2-validation/"
-MII_ENDPOINT = MII_IMPORT_ENDPOINT if MII_MODE == "import" else MII_VALIDATION_ENDPOINT
+MII_ENDPOINT = MII_IMPORT_ENDPOINT if _mii_mode == "import" else MII_VALIDATION_ENDPOINT
 
 # Viewer auth (viewer-only; scheduler runs regardless)
-VIEWER_PASSWORDS = set(st.secrets.get("viewer_passwords", []))
+VIEWER_PASSWORDS = set(st.secrets.get("viewer_passwords", st.secrets.get("general", {}).get("viewer_passwords", [])))
 
 # Scheduled hours in SAST
 HOUR_WINDOW_START = 4    # inclusive
 HOUR_WINDOW_END = 20     # inclusive
 XML_POST_HOUR = 21       # 21:00 SAST
+
+# Datalogger identity for VCOM XML
+DL_VENDOR = "SolaX"
+DL_SERIAL = "DL-PUBLIC-SHARE"
+DEVICE_ID = "inverter-1"
+DEVICE_UID = "INV-1"
 
 # ------------------------------------------------------------
 # Time helpers
@@ -71,15 +97,25 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 def now_sast() -> datetime:
-    if ZoneInfo is None:
-        # best effort fallback
+    if TZ is None:
+        # best effort fallback to local time
         return datetime.fromtimestamp(time.time())
-    return now_utc().astimezone(ZoneInfo(TZ_NAME))
+    return now_utc().astimezone(TZ)
+
+def utc_from_sast_components(d: datetime, hour: int) -> datetime:
+    """Build a SAST datetime at given hour and return as UTC aware dt"""
+    if TZ is None:
+        # fallback - assume local is SAST-ish
+        return datetime(d.year, d.month, d.day, hour, 0, 0, tzinfo=timezone.utc)
+    local_dt = datetime(d.year, d.month, d.day, hour, 0, 0, tzinfo=TZ)
+    return local_dt.astimezone(timezone.utc)
 
 # ------------------------------------------------------------
 # Fetch and parse Daily yield via Jina (markdown snapshot)
 # ------------------------------------------------------------
 def fetch_markdown_via_jina(page_url: str) -> str:
+    if not JINA_TOKEN:
+        raise RuntimeError("JINA_TOKEN is missing in secrets.")
     headers = {
         "Authorization": f"Bearer {JINA_TOKEN}",
         "Content-Type": "application/json",
@@ -104,7 +140,7 @@ def extract_daily_kwh_from_markdown(md: str) -> float:
     )
     m = pat.search(md)
     if not m:
-        # Fallback: first number on the same line as "Daily yield"
+        # Fallback: first number on a "Daily yield" line
         number_str = None
         for line in md.splitlines():
             if "daily" in line.lower() and "yield" in line.lower():
@@ -161,8 +197,9 @@ def parse_csv() -> pd.DataFrame:
         return pd.DataFrame(columns=["timestamp_utc", "timestamp_sast", "daily_kwh", "interval_kwh"])
     df = pd.read_csv(CSV_FILE)
     df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True, errors="coerce")
-    if ZoneInfo is not None:
-        df["timestamp_sast_dt"] = df["timestamp_utc"].dt.tz_convert(ZoneInfo(TZ_NAME))
+    # Keep a local copy for day filtering
+    if TZ is not None:
+        df["timestamp_sast_dt"] = df["timestamp_utc"].dt.tz_convert(TZ)
     else:
         df["timestamp_sast_dt"] = df["timestamp_utc"]
     return df
@@ -180,62 +217,108 @@ def rows_for_sast_day(target_day) -> pd.DataFrame:
     day_df = day_df.sort_values("timestamp_utc").reset_index(drop=True)
     return day_df
 
+def expected_hour_grid_utc(target_day) -> Iterable[datetime]:
+    """Yield expected UTC datetimes for each hour in the configured window of the SAST day."""
+    for h in range(HOUR_WINDOW_START, HOUR_WINDOW_END + 1):
+        yield utc_from_sast_components(datetime(target_day.year, target_day.month, target_day.day), h)
+
 # ------------------------------------------------------------
-# XML build and HTTPS post (hourly intervals)
+# XML build and HTTPS post (hourly intervals) - fixed namespaces
 # ------------------------------------------------------------
 def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
     """
-    Build an MII XML document with one datapoint per hour in day_df.
+    Build an MII XML document with one datapoint per hour in the configured SAST window.
     interval="3600" and mv t="E_INT" with value in kWh for that hour.
+    - Root and <datalogger> in main namespace http://api.sspcdn.com/mii
+    - <configuration> in http://api.sspcdn.com/mii/datalogger/configuration
+    - <datapoints> in http://api.sspcdn.com/mii/datalogger/datapoints
     """
     NS_MAIN   = "http://api.sspcdn.com/mii"
     NS_CONFIG = "http://api.sspcdn.com/mii/datalogger/configuration"
     NS_DATA   = "http://api.sspcdn.com/mii/datalogger/datapoints"
 
+    # Register namespaces - default only for main
     ET.register_namespace("", NS_MAIN)
-    mii = ET.Element(ET.QName(NS_MAIN, "mii"), attrib={"version": "2.0", "targetNamespace": NS_MAIN})
-    datalogger = ET.SubElement(mii, "datalogger")
+    ET.register_namespace("cfg", NS_CONFIG)
+    ET.register_namespace("dp", NS_DATA)
 
-    ET.register_namespace("", NS_CONFIG)
+    # Root
+    mii = ET.Element(ET.QName(NS_MAIN, "mii"),
+                     attrib={"version": "2.0", "targetNamespace": NS_MAIN})
+    datalogger = ET.SubElement(mii, ET.QName(NS_MAIN, "datalogger"))
+
+    # configuration block
     cfg = ET.SubElement(datalogger, ET.QName(NS_CONFIG, "configuration"))
-    uuid_el = ET.SubElement(cfg, "uuid")
-    ET.SubElement(uuid_el, "vendor").text = "SolaX"
-    ET.SubElement(uuid_el, "serial").text = "DL-PUBLIC-SHARE"
-    ET.SubElement(cfg, "name").text = PLANT_NAME
-    ET.SubElement(cfg, "firmware").text = "n/a"
-    ET.SubElement(cfg, "next-scheduled-transfer").text = now_utc().replace(microsecond=0).isoformat().replace("+00:00","Z")
+    uuid_el = ET.SubElement(cfg, ET.QName(NS_CONFIG, "uuid"))
+    ET.SubElement(uuid_el, ET.QName(NS_CONFIG, "vendor")).text = DL_VENDOR
+    ET.SubElement(uuid_el, ET.QName(NS_CONFIG, "serial")).text = DL_SERIAL
+    ET.SubElement(cfg, ET.QName(NS_CONFIG, "name")).text = PLANT_NAME
+    ET.SubElement(cfg, ET.QName(NS_CONFIG, "firmware")).text = "n/a"
+    ET.SubElement(cfg, ET.QName(NS_CONFIG, "next-scheduled-transfer")).text = \
+        now_utc().replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-    devices = ET.SubElement(cfg, "devices")
-    dev = ET.SubElement(devices, "device", attrib={"type": "inverter", "id": "inverter-1"})
-    ET.SubElement(dev, "uid").text = "INV-1"
+    devices = ET.SubElement(cfg, ET.QName(NS_CONFIG, "devices"))
+    dev = ET.SubElement(devices, ET.QName(NS_CONFIG, "device"),
+                        attrib={"type": "inverter", "id": DEVICE_ID})
+    ET.SubElement(dev, ET.QName(NS_CONFIG, "uid")).text = DEVICE_UID
 
-    ET.register_namespace("", NS_DATA)
+    # datapoints block
     dps = ET.SubElement(datalogger, ET.QName(NS_DATA, "datapoints"))
 
-    for _, row in day_df.iterrows():
-        ts_utc: pd.Timestamp = row["timestamp_utc"]
-        interval_kwh = float(row["interval_kwh"])
-        dp = ET.SubElement(dps, "datapoint", attrib={
+    # Build a map from exact UTC hour to interval_kwh
+    hour_map: Dict[datetime, float] = {}
+    if not day_df.empty:
+        # Round any accidental minute offsets down to exact hour
+        day_df["hour_utc"] = day_df["timestamp_utc"].dt.floor("H")
+        for _, row in day_df.iterrows():
+            hour_map[row["hour_utc"].to_pydatetime()] = float(row["interval_kwh"])
+
+    target_day = day_df["timestamp_sast_dt"].dt.date.iloc[0] if not day_df.empty else now_sast().date()
+
+    # Emit one datapoint per expected hour in the SAST window
+    missing_hours = []
+    for ts_utc in expected_hour_grid_utc(target_day):
+        interval_kwh = float(hour_map.get(ts_utc.replace(minute=0, second=0, microsecond=0), 0.0))
+        if ts_utc not in hour_map:
+            missing_hours.append(ts_utc.isoformat())
+
+        dp = ET.SubElement(dps, ET.QName(NS_DATA, "datapoint"), attrib={
             "interval": "3600",
             "timestamp": ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
-        dv = ET.SubElement(dp, "device", attrib={"id": "inverter-1"})
-        # Interval energy for that hour in kWh
-        ET.SubElement(dv, "mv", attrib={"t": "E_INT", "v": f"{interval_kwh:.3f}"})
+        dv = ET.SubElement(dp, ET.QName(NS_DATA, "device"), attrib={"id": DEVICE_ID})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "E_INT", "v": f"{interval_kwh:.3f}"})
 
     xml_bytes = ET.tostring(mii, encoding="utf-8", xml_declaration=True)
     XML_OUT.write_bytes(xml_bytes)
+
+    if missing_hours:
+        print(f"[MII] Warning - missing hourly samples filled with 0. Hours (UTC): {missing_hours[:6]}{'...' if len(missing_hours)>6 else ''}")
+
     return xml_bytes
 
-def post_xml_to_mii(xml_payload: bytes) -> tuple[int, str]:
+def post_xml_to_mii(xml_payload: bytes) -> Tuple[int, str]:
+    """Post to MII endpoint and return (status_code, response_text). Also log to console and file."""
+    if not MII_API_KEY:
+        raise RuntimeError("MII_API_KEY is missing in secrets.")
+
     headers = {
         "Content-Type": "application/xml; charset=utf-8",
+        "Accept": "application/json",
         "api-key": MII_API_KEY,
     }
     try:
         r = requests.post(MII_ENDPOINT, headers=headers, data=xml_payload, timeout=60)
-        print(f"[MII] POST {MII_ENDPOINT} -> {r.status_code} {r.text[:200]}")
-        return r.status_code, r.text[:1000]
+        code, body = r.status_code, (r.text or "")
+        print(f"[MII] POST {MII_ENDPOINT} -> {code} {body[:200].replace(os.linesep, ' ')}")
+        LAST_POST_JSON.write_text(json.dumps({
+            "time": now_sast().isoformat(),
+            "endpoint": MII_ENDPOINT,
+            "status": code,
+            "body": body[:2000]
+        }, indent=2), encoding="utf-8")
+        return code, body[:2000]
     except Exception as e:
         print(f"[MII] POST {MII_ENDPOINT} failed: {e}")
         return 0, str(e)
@@ -266,14 +349,14 @@ def run_fetch_job() -> dict:
     append_csv(now_utc(), daily_kwh, interval)
     return {"daily_kwh": daily_kwh, "interval_kwh": interval}
 
-def manual_xml_and_transfer() -> tuple[int, str]:
+def manual_xml_and_transfer() -> Tuple[int, str]:
     # Build for today's SAST day
     day_df = rows_for_sast_day(now_sast().date())
     if day_df.empty:
         raise RuntimeError("No rows for today yet. Fetch at least once before generating XML.")
     xml_bytes = build_mii_xml_hourly(day_df)
     code, body = post_xml_to_mii(xml_bytes)
-    print(f"[MII] Manual transfer -> {code} {body[:200]}")
+    print(f"[MII] Manual transfer -> {code} {body[:200].replace(os.linesep, ' ')}")
     return code, body
 
 # ------------------------------------------------------------
@@ -297,7 +380,7 @@ def scheduler_loop(stop_event: threading.Event, status_queue: queue.Queue):
             if last_fetch_iso:
                 try:
                     last_fetch = datetime.fromisoformat(last_fetch_iso.replace("Z", "+00:00"))
-                    last_fetch_local = last_fetch.astimezone(ZoneInfo(TZ_NAME)) if ZoneInfo else last_fetch
+                    last_fetch_local = last_fetch.astimezone(TZ) if TZ else last_fetch
                     already_fetched_this_hour = (
                         last_fetch_local.year == local_now.year and
                         last_fetch_local.month == local_now.month and
@@ -454,10 +537,16 @@ def render_dashboard(status_q: queue.Queue):
 
     st.divider()
     st.subheader("XML transfer")
-    st.markdown(f"- Mode: **{MII_MODE}**  • Endpoint: `{MII_ENDPOINT}`")
+    st.markdown(f"- Mode: **{_mii_mode}**  • Endpoint: `{MII_ENDPOINT}`")
     if XML_OUT.exists():
         st.markdown(f"- Last XML file: `{XML_OUT}`  • Size: {XML_OUT.stat().st_size} bytes")
+        with XML_OUT.open("rb") as f:
+            preview = f.read(800).decode("utf-8", errors="ignore")
+        st.code(preview + ("\n..." if XML_OUT.stat().st_size > 800 else ""), language="xml")
         st.download_button("Download last XML", XML_OUT.read_bytes(), file_name=XML_OUT.name, mime="application/xml")
+    if LAST_POST_JSON.exists():
+        st.caption("Last POST result:")
+        st.code(LAST_POST_JSON.read_text(encoding="utf-8")[:2000], language="json")
 
 # ------------------------------------------------------------
 # App entry
