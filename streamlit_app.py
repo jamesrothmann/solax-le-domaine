@@ -90,6 +90,12 @@ FTP_COMPRESS = (st.secrets.get("FTP_COMPRESS", st.secrets.get("ftp", {}).get("FT
 # Viewer auth
 VIEWER_PASSWORDS = set(st.secrets.get("viewer_passwords", st.secrets.get("general", {}).get("viewer_passwords", [])))
 
+# Approximation constants (optional in secrets; fall back to sane defaults)
+INV_EFF = float(st.secrets.get("INV_EFF",  st.secrets.get("approx", {}).get("INV_EFF", 0.982)))
+VAC     = float(st.secrets.get("VAC",      st.secrets.get("approx", {}).get("VAC",     245.0)))
+PF      = float(st.secrets.get("PF",       st.secrets.get("approx", {}).get("PF",      1.0)))
+VMPPT   = float(st.secrets.get("VMPPT",    st.secrets.get("approx", {}).get("VMPPT",   221.0)))
+
 # Schedule
 HOUR_WINDOW_START = 4
 HOUR_WINDOW_END   = 20
@@ -217,7 +223,16 @@ def rows_for_sast_day(target_day) -> pd.DataFrame:
 def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
     """
     Build an MII XML document with one datapoint per row in day_df.
-    interval="3600" and mv t="E_INT" with value in kWh for that hour.
+    interval="3600".
+    Emits:
+      - E_INT  : interval_kwh (kWh)
+      - P_AC   : avg AC power (W) from interval_kwh
+      - P_DC   : est. DC power (W)
+      - I_AC   : est. AC current (A)
+      - I_DC   : est. DC current (A)
+      - COS_PHI: assumed PF
+      - U_AC1  : assumed AC volts
+      - E_DAY  : cumulative Wh for the day
     """
     NS_MAIN   = "http://api.sspcdn.com/mii"
     NS_CONFIG = "http://api.sspcdn.com/mii/datalogger/configuration"
@@ -231,6 +246,7 @@ def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
                      attrib={"version": "2.0", "targetNamespace": NS_MAIN})
     datalogger = ET.SubElement(mii, ET.QName(NS_MAIN, "datalogger"))
 
+    # --- configuration
     cfg = ET.SubElement(datalogger, ET.QName(NS_CONFIG, "configuration"))
     uuid_el = ET.SubElement(cfg, ET.QName(NS_CONFIG, "uuid"))
     ET.SubElement(uuid_el, ET.QName(NS_CONFIG, "vendor")).text = DL_VENDOR
@@ -245,18 +261,52 @@ def build_mii_xml_hourly(day_df: pd.DataFrame) -> bytes:
                         attrib={"type": "inverter", "id": DEVICE_ID})
     ET.SubElement(dev, ET.QName(NS_CONFIG, "uid")).text = DEVICE_UID
 
+    # --- datapoints
     dps = ET.SubElement(datalogger, ET.QName(NS_DATA, "datapoints"))
 
-    for _, row in day_df.iterrows():
+    # cumulative day Wh for E_DAY
+    df = day_df.copy()
+    df["interval_kwh"] = pd.to_numeric(df["interval_kwh"], errors="coerce").fillna(0.0)
+    df["cum_kwh"] = df["interval_kwh"].cumsum()
+    df = df.sort_values("timestamp_utc")
+
+    for _, row in df.iterrows():
         ts_utc = pd.to_datetime(row["timestamp_utc"], utc=True)
         interval_kwh = float(row["interval_kwh"])
+        cum_kwh = float(row["cum_kwh"])
+
+        # Core transforms
+        pac_w = interval_kwh * 1000.0                 # average W over the hour
+        pdc_w = pac_w / INV_EFF if INV_EFF > 0 else pac_w
+        iac_a = pac_w / (VAC * PF) if (VAC > 0 and PF > 0) else 0.0
+        idc_a = pdc_w / VMPPT if VMPPT > 0 else 0.0
+        e_day_wh = cum_kwh * 1000.0
+
         dp = ET.SubElement(dps, ET.QName(NS_DATA, "datapoint"), attrib={
             "interval": "3600",
             "timestamp": ts_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
         })
         dv = ET.SubElement(dp, ET.QName(NS_DATA, "device"), attrib={"id": DEVICE_ID})
+
+        # Required original metric
         ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
                       attrib={"t": "E_INT", "v": f"{interval_kwh:.3f}"})
+
+        # Additional approximations
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "P_AC", "v": f"{pac_w:.2f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "P_DC", "v": f"{pdc_w:.2f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "I_AC", "v": f"{iac_a:.3f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "I_DC", "v": f"{idc_a:.3f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "COS_PHI", "v": f"{PF:.3f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "U_AC1", "v": f"{VAC:.1f}"})
+        ET.SubElement(dv, ET.QName(NS_DATA, "mv"),
+                      attrib={"t": "E_DAY", "v": f"{e_day_wh:.0f}"})
 
     xml_bytes = ET.tostring(mii, encoding="utf-8", xml_declaration=True)
     XML_OUT.write_bytes(xml_bytes)
